@@ -36,8 +36,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-import requests
-from requests.adapters import HTTPAdapter
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+except ModuleNotFoundError:
+    # Самая частая причина «скрипт не открывается / окно мигает и закрывается»:
+    # не установлена библиотека requests. Даём понятное сообщение и не даём окну закрыться.
+    print("\n[ОШИБКА] Не установлена библиотека 'requests'.")
+    print("Установите её командой:\n")
+    print("    pip install requests\n")
+    print("(или: python -m pip install -r requirements.txt)\n")
+    try:
+        input("Нажмите Enter, чтобы закрыть окно…")
+    except EOFError:
+        pass
+    raise SystemExit(1)
 
 try:
     # urllib3 поставляется вместе с requests
@@ -563,9 +576,25 @@ def print_final_report(summary_rows: list) -> None:
     print("=" * 60 + "\n")
 
 
+def _pause_if_double_click() -> None:
+    """На Windows при запуске двойным кликом не даём окну закрыться сразу."""
+    if os.name == "nt" and len(sys.argv) == 1:
+        try:
+            input("\nГотово. Нажмите Enter, чтобы закрыть окно…")
+        except EOFError:
+            pass
+
+
 if __name__ == "__main__":
+    code = 0
     try:
-        sys.exit(main())
+        code = main()
     except KeyboardInterrupt:
         log.warning("Прервано пользователем.")
-        sys.exit(130)
+        code = 130
+    except Exception:
+        log.exception("Критическая ошибка")
+        code = 1
+    finally:
+        _pause_if_double_click()
+    sys.exit(code)
