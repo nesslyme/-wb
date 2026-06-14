@@ -382,27 +382,29 @@ def review_to_row(fb: dict, dt: Optional[datetime], brand_fallback: str, name_fa
 
 
 def filter_reviews(feedbacks: list, nm_id: int, days: int,
-                   brand_fallback: str, name_fallback: str) -> list:
+                   brand_fallback: str, name_fallback: str,
+                   scope: str = "all") -> list:
     """
-    Применяет все фильтры ТЗ:
-      • только нужный артикул (защита от склейки),
-      • только отзывы с текстом длиной >= MIN_TEXT_LEN,
-      • только за последние `days` дней.
+    Применяет фильтры:
+      • scope="all"     — берём ВСЕ отзывы карточки/склейки (как видит покупатель);
+        scope="article" — только отзывы с точным артикулом nm_id (анти-склейка);
+      • текст длиной >= MIN_TEXT_LEN (пустые/слишком короткие отбрасываем);
+      • дата за последние `days` дней (days<=0 — без ограничения по дате).
     Возвращает список готовых строк CSV (отсортированных по дате, новые сверху).
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)) if days and days > 0 else None
     rows = []
     for fb in feedbacks:
-        # 1) фильтр по артикулу — главное правило против склейки
-        if feedback_nm_id(fb) != nm_id:
+        # 1) фильтр по артикулу — только в строгом режиме "article"
+        if scope == "article" and feedback_nm_id(fb) != nm_id:
             continue
         # 2) фильтр по тексту
         text = (fb.get("text") or "").strip()
         if len(text) < MIN_TEXT_LEN:
             continue
-        # 3) фильтр по дате
+        # 3) фильтр по дате (если задано ограничение)
         dt = parse_date(fb.get("createdDate") or fb.get("updatedDate"))
-        if dt is not None and dt < cutoff:
+        if cutoff is not None and dt is not None and dt < cutoff:
             continue
         rows.append((dt, review_to_row(fb, dt, brand_fallback, name_fallback)))
     # новые отзывы сверху; отзывы без даты — в конец
@@ -443,7 +445,8 @@ def write_summary_csv(path: Path, summary_rows: list) -> None:
 # Обработка одного артикула
 # --------------------------------------------------------------------------- #
 
-def process_article(session: requests.Session, nm_id: int, out_root: Path, days: int) -> dict:
+def process_article(session: requests.Session, nm_id: int, out_root: Path, days: int,
+                    scope: str = "all") -> dict:
     """
     Полный цикл по одному артикулу. Никогда не бросает исключение наружу —
     при любой ошибке возвращает статус с описанием, чтобы выгрузка продолжалась.
@@ -477,6 +480,7 @@ def process_article(session: requests.Session, nm_id: int, out_root: Path, days:
         rows = filter_reviews(
             fb_data["feedbacks"], nm_id, days,
             brand_fallback=result["brand"], name_fallback=result["name"],
+            scope=scope,
         )
         result["saved"] = len(rows)
 
@@ -572,7 +576,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("-f", "--file", help="Путь к TXT/CSV со списком артикулов.")
     p.add_argument("-o", "--output", default=".", help="Каталог, где создать папку выгрузки.")
     p.add_argument("-d", "--days", type=int, default=DEFAULT_DAYS,
-                   help=f"За сколько последних дней брать отзывы (по умолчанию {DEFAULT_DAYS}).")
+                   help=(f"За сколько последних дней брать отзывы (по умолчанию {DEFAULT_DAYS}). "
+                         "0 — без ограничения по дате (все отзывы за всё время)."))
+    p.add_argument("--scope", choices=["all", "article"], default="all",
+                   help=("all — ВСЕ отзывы карточки/склейки, как на странице товара "
+                         "(по умолчанию); article — только указанный артикул (анти-склейка)."))
     p.add_argument("--delay", type=float, default=REQUEST_DELAY,
                    help="Задержка между запросами, сек.")
     return p.parse_args(argv)
@@ -605,14 +613,16 @@ def main(argv=None) -> int:
     stamp = datetime.now().strftime("%d-%m-%Y %H-%M")
     out_root = Path(args.output) / f"выгрузка отзывов {stamp}"
     out_root.mkdir(parents=True, exist_ok=True)
+    period = "без ограничения" if args.days <= 0 else f"последние {args.days} дн."
+    scope_txt = "вся карточка/склейка" if args.scope == "all" else "только артикул"
     log.info("Папка выгрузки: %s", out_root)
-    log.info("Артикулов к обработке: %d | период: последние %d дн.", len(articles), args.days)
+    log.info("Артикулов: %d | период: %s | охват: %s", len(articles), period, scope_txt)
 
     session = build_session()
     summary_rows = []
     for i, nm_id in enumerate(articles, 1):
         log.info("[%d/%d] === Артикул %s ===", i, len(articles), nm_id)
-        res = process_article(session, nm_id, out_root, args.days)
+        res = process_article(session, nm_id, out_root, args.days, scope=args.scope)
         summary_rows.append([
             res["nm_id"], res["brand"], res["name"], res["url"],
             res["found"], res["found_with_text"], res["saved"],
