@@ -166,18 +166,23 @@ def build_session() -> requests.Session:
     return s
 
 
-def get_json(session: requests.Session, url: str, params: Optional[dict] = None) -> Optional[dict]:
+def get_json(session: requests.Session, url: str, params: Optional[dict] = None,
+             max_attempts: int = MAX_RETRIES, missing_codes=(404,),
+             quiet: bool = False) -> Optional[dict]:
     """
     GET-запрос с возвратом JSON. Сам обрабатывает сетевые ошибки и делает
     повторные попытки с экспоненциальной паузой (2,4,8,16 сек).
     Возвращает dict или None (если так и не удалось получить данные).
+
+    max_attempts  — число попыток (для лёгкого перебора CDN ставим 1);
+    missing_codes — коды, которые трактуем как «здесь данных нет» (не ошибка);
+    quiet         — не шуметь в лог при неудаче (для перебора хостов).
     """
     last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_attempts + 1):
         try:
             resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 404:
-                # Для отзывов 404 означает "нет данных на этом хосте" — это не ошибка.
+            if resp.status_code in missing_codes:
                 return None
             resp.raise_for_status()
             if not resp.content:
@@ -185,11 +190,14 @@ def get_json(session: requests.Session, url: str, params: Optional[dict] = None)
             return resp.json()
         except (requests.RequestException, ValueError) as e:
             last_err = e
-            wait = BACKOFF_BASE ** attempt
-            log.warning("Запрос не удался (попытка %d/%d): %s. Ждём %d сек…",
-                        attempt, MAX_RETRIES, e, wait)
-            time.sleep(wait)
-    log.error("Не удалось получить данные с %s: %s", url, last_err)
+            if attempt < max_attempts:
+                wait = BACKOFF_BASE ** attempt
+                if not quiet:
+                    log.warning("Запрос не удался (попытка %d/%d): %s. Ждём %d сек…",
+                                attempt, max_attempts, e, wait)
+                time.sleep(wait)
+    if not quiet:
+        log.error("Не удалось получить данные с %s: %s", url, last_err)
     return None
 
 
@@ -197,11 +205,11 @@ def get_json(session: requests.Session, url: str, params: Optional[dict] = None)
 # Шаг 1. Определение imtId (склейки), бренда и названия по артикулу
 # --------------------------------------------------------------------------- #
 
-def resolve_card(session: requests.Session, nm_id: int) -> dict:
+def resolve_card_via_api(session: requests.Session, nm_id: int) -> dict:
     """
-    По артикулу (nmId) получает данные карточки:
-      imt_id (root склейки), brand, name.
-    Возвращает dict с ключами imt_id/brand/name (любое может быть None).
+    Способ 1 (быстрый): поисковый API карточки card.wb.ru.
+    Работает для товаров, которые есть в продаже/в выдаче.
+    Возвращает dict imt_id/brand/name (значения могут быть None).
     """
     for host in CARD_HOSTS:
         params = dict(CARD_PARAMS, nm=str(nm_id))
@@ -218,6 +226,75 @@ def resolve_card(session: requests.Session, nm_id: int) -> dict:
             "name": (p.get("name") or "").strip() or None,
         }
     return {"imt_id": None, "brand": None, "name": None}
+
+
+def _basket_host_guess(vol: int) -> str:
+    """Предполагаемый номер CDN-сервера (basket-XX) по диапазону vol. Это лишь стартовая
+    догадка; если она не сработает, мы переберём остальные хосты."""
+    ranges = [
+        (0, 143, "01"), (144, 287, "02"), (288, 431, "03"), (432, 719, "04"),
+        (720, 1007, "05"), (1008, 1061, "06"), (1062, 1115, "07"), (1116, 1169, "08"),
+        (1170, 1313, "09"), (1314, 1601, "10"), (1602, 1655, "11"), (1656, 1919, "12"),
+        (1920, 2045, "13"), (2046, 2189, "14"), (2190, 2405, "15"), (2406, 2621, "16"),
+        (2622, 2837, "17"), (2838, 3053, "18"), (3054, 3269, "19"), (3270, 3485, "20"),
+        (3486, 3701, "21"), (3702, 3917, "22"), (3918, 4133, "23"), (4134, 4349, "24"),
+        (4350, 4565, "25"),
+    ]
+    for lo, hi, host in ranges:
+        if lo <= vol <= hi:
+            return host
+    return "26"
+
+
+def resolve_card_via_basket(session: requests.Session, nm_id: int) -> dict:
+    """
+    Способ 2 (надёжный): статический card.json на CDN-серверах WB (basket-XX).
+    Здесь у КАЖДОГО товара лежит поле imt_id — работает, даже если товара нет
+    в поисковой выдаче (распродан/скрыт). Это и позволяет указывать только артикул.
+
+    Перебираем хосты, начиная с наиболее вероятного, и берём первый ответ с imt_id.
+    """
+    vol = nm_id // 100000
+    part = nm_id // 1000
+    guess = _basket_host_guess(vol)
+    # порядок: сначала догадка, затем все остальные номера хостов
+    host_numbers = [guess] + [f"{i:02d}" for i in range(1, 31) if f"{i:02d}" != guess]
+    domains = ("wbbasket.ru", "wb.ru")  # WB сменил домен; пробуем оба
+    for host in host_numbers:
+        for dom in domains:
+            url = (f"https://basket-{host}.{dom}/vol{vol}/part{part}/"
+                   f"{nm_id}/info/ru/card.json")
+            data = get_json(session, url, max_attempts=1,
+                            missing_codes=(403, 404), quiet=True)
+            if data and data.get("imt_id"):
+                selling = data.get("selling") or {}
+                brand = (selling.get("brand_name") or data.get("brand")
+                         or selling.get("brand") or "").strip() or None
+                name = (data.get("imt_name") or data.get("subj_name") or "").strip() or None
+                return {"imt_id": data.get("imt_id"), "brand": brand, "name": name}
+    return {"imt_id": None, "brand": None, "name": None}
+
+
+def resolve_card(session: requests.Session, nm_id: int) -> dict:
+    """
+    По артикулу (nmId) определяет imt_id (склейку), бренд и название.
+    Использует два независимых источника, чтобы не требовать ручной ввод imtId:
+      1) card.wb.ru — быстро, но только для товаров «в выдаче»;
+      2) basket CDN card.json — надёжно, работает и для скрытых/распроданных.
+    Если первый не дал imt_id — автоматически пробуем второй и дополняем бренд/название.
+    """
+    res = resolve_card_via_api(session, nm_id)
+    if res.get("imt_id"):
+        return res
+
+    log.info("Артикул %s: card.wb.ru не дал imtId, пробую CDN (card.json)…", nm_id)
+    alt = resolve_card_via_basket(session, nm_id)
+    # объединяем: imt_id берём из CDN, бренд/название — откуда есть
+    return {
+        "imt_id": alt.get("imt_id") or res.get("imt_id"),
+        "brand": alt.get("brand") or res.get("brand"),
+        "name": alt.get("name") or res.get("name"),
+    }
 
 
 # --------------------------------------------------------------------------- #
