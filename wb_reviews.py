@@ -11,10 +11,13 @@ wb_reviews.py — выгрузка отзывов покупателей Wildber
   Цепочка запросов:
     1) card.wb.ru/cards/v2/detail?nm=<артикул>   -> получаем root (imtId), бренд, название.
        imtId — это и есть "склейка": общий идентификатор для группы вариантов товара.
-    2) feedbacks{1,2}.wb.ru/feedbacks/v{1,2}/<imtId> -> отзывы склейки.
-       ВАЖНО: один ответ может содержать лишь ЧАСТЬ отзывов (WB шардирует их по
-       хостам/версиям), поэтому опрашиваем ВСЕ эндпоинты и ОБЪЕДИНЯЕМ результат
-       (дедуп по id). Затем сами фильтруем по тексту и дате.
+    2) Отзывы склейки. У WB есть жёсткий лимит выдачи ~1000 отзывов на один запрос:
+       - статический GET feedbacks{1,2}.wb.ru/feedbacks/v{1,2}/<imtId> отдаёт ~1000
+         самых свежих (используется как запас);
+       - постраничный POST feedbacks{1,2}.wb.ru/api/v1/feedbacks/site (skip/take) —
+         основной источник; чтобы обойти лимит глубины, листаем его не только «все
+         подряд», но и отдельно по каждой оценке 1..5, после чего ОБЪЕДИНЯЕМ всё
+         (дедуп по id). Затем сами фильтруем по тексту и дате.
 
   Решение проблемы "склейки" (см. п.3 ТЗ):
     Ответ feedbacks содержит для КАЖДОГО отзыва поле nmId (и productDetails.nmId).
@@ -79,14 +82,23 @@ CARD_HOSTS = [
 ]
 CARD_PARAMS = {"appType": "1", "curr": "rub", "dest": "-1257786", "spp": "30"}
 
-# Хосты/версии API отзывов. Данные шардированы между feedbacks1 и feedbacks2,
-# поэтому перебираем все варианты и берём первый, где есть отзывы.
+# Статические эндпоинты отзывов (GET). Отдают максимум ~1000 самых свежих отзывов
+# на склейку — этого мало для популярных товаров, поэтому используются как ЗАПАС.
 FEEDBACK_ENDPOINTS = [
     "https://feedbacks1.wb.ru/feedbacks/v1/{imt}",
     "https://feedbacks2.wb.ru/feedbacks/v2/{imt}",
     "https://feedbacks1.wb.ru/feedbacks/v2/{imt}",
     "https://feedbacks2.wb.ru/feedbacks/v1/{imt}",
 ]
+
+# Постраничный «site»-API отзывов (POST). Именно его дёргает сайт при прокрутке.
+# Позволяет листать через skip/take и фильтровать по оценке — так обходим лимит ~1000.
+SITE_API_ENDPOINTS = [
+    "https://feedbacks2.wb.ru/api/v1/feedbacks/site",
+    "https://feedbacks1.wb.ru/api/v1/feedbacks/site",
+]
+SITE_TAKE = 100             # сколько отзывов запрашивать за один запрос
+SITE_MAX_SKIP = 5000        # предохранитель от бесконечной прокрутки в одной «нарезке»
 
 # Заголовки CSV с отзывами (на русском). Это и есть "список полей" —
 # чтобы добавить/убрать колонку, измените REVIEW_COLUMNS и функцию review_to_row().
@@ -202,6 +214,35 @@ def get_json(session: requests.Session, url: str, params: Optional[dict] = None,
     return None
 
 
+def post_json(session: requests.Session, url: str, payload: dict,
+              max_attempts: int = 2, quiet: bool = False) -> Optional[dict]:
+    """POST JSON и возврат JSON-ответа. Логирует HTTP-статус при первом обращении
+    (для диагностики постраничного API). Возвращает dict или None."""
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+            if resp.status_code >= 400:
+                if not quiet:
+                    log.info("    POST %s -> HTTP %s", url, resp.status_code)
+                return None
+            if not resp.content:
+                return None
+            return resp.json()
+        except (requests.RequestException, ValueError) as e:
+            last_err = e
+            if attempt < max_attempts:
+                time.sleep(BACKOFF_BASE ** attempt)
+    if not quiet:
+        log.info("    POST %s -> ошибка: %s", url, last_err)
+    return None
+
+
+def feedback_key(fb: dict):
+    """Ключ для дедупликации отзыва: по id, иначе по (nmId, текст, дата)."""
+    return fb.get("id") or (fb.get("nmId"), fb.get("text"), fb.get("createdDate"))
+
+
 # --------------------------------------------------------------------------- #
 # Шаг 1. Определение imtId (склейки), бренда и названия по артикулу
 # --------------------------------------------------------------------------- #
@@ -302,44 +343,110 @@ def resolve_card(session: requests.Session, nm_id: int) -> dict:
 # Шаг 2. Загрузка всех отзывов склейки по imtId
 # --------------------------------------------------------------------------- #
 
-def fetch_feedbacks(session: requests.Session, imt_id: int) -> dict:
+def _collect_static(session: requests.Session, imt_id: int, merged: dict) -> tuple:
     """
-    Собирает ВСЕ отзывы склейки.
-
-    Важно: WB раздаёт отзывы по разным хостам/версиям (feedbacks1/feedbacks2, v1/v2),
-    и один ответ может содержать лишь ЧАСТЬ отзывов (хотя в метаданных feedbackCount
-    указано полное число). Поэтому мы опрашиваем ВСЕ эндпоинты и ОБЪЕДИНЯЕМ отзывы,
-    убирая дубли по id. Раньше бралась первая непустая выдача — из-за этого терялась
-    основная масса отзывов (например, сохранялось 218 вместо 13681).
-
-    Возвращает dict: feedbacks (list), count (int), count_with_text (int).
+    ЗАПАСНОЙ источник: статические GET-эндпоинты (отдают максимум ~1000 свежих
+    отзывов). Кладёт отзывы в merged (дедуп по ключу). Возвращает (count, count_with_text).
     """
-    merged: dict = {}            # ключ -> отзыв, чтобы не было дублей
-    count = 0
-    count_with_text = 0
-
+    count = count_with_text = 0
     for tmpl in FEEDBACK_ENDPOINTS:
         url = tmpl.format(imt=imt_id)
         data = get_json(session, url)
         if not data:
             continue
         fbs = data.get("feedbacks") or []
-        # метаданные (полные счётчики) берём максимальные из всех ответов
         count = max(count, int(data.get("feedbackCount") or 0))
         count_with_text = max(count_with_text, int(data.get("feedbackCountWithText") or 0))
         for fb in fbs:
-            # дедуп: по id отзыва, а если id нет — по (nmId, текст, дата)
-            key = fb.get("id") or (
-                fb.get("nmId"), fb.get("text"), fb.get("createdDate"))
-            if key not in merged:
-                merged[key] = fb
-        log.info("  • %s -> в этом ответе %d, уникальных всего %d",
-                 url, len(fbs), len(merged))
+            merged.setdefault(feedback_key(fb), fb)
+        log.info("  [static] %s -> %d отзывов, уникальных всего %d", url, len(fbs), len(merged))
         time.sleep(REQUEST_DELAY)
+    return count, count_with_text
 
+
+def _paginate_site(session: requests.Session, url: str, imt_id: int,
+                   extra: dict, merged: dict) -> int:
+    """
+    Листает один «срез» постраничного API (с фиксированным фильтром `extra`,
+    например {'valuation': 5}) через skip/take, пока не закончатся отзывы или не
+    упрёмся в предохранитель SITE_MAX_SKIP. Возвращает, сколько НОВЫХ отзывов добавлено.
+    """
+    added = 0
+    skip = 0
+    while skip <= SITE_MAX_SKIP:
+        payload = {"imtId": imt_id, "skip": skip, "take": SITE_TAKE,
+                   "order": "dateDesc", **extra}
+        data = post_json(session, url, payload, quiet=True)
+        if not data:
+            break
+        fbs = data.get("feedbacks") or []
+        if not fbs:
+            break
+        before = len(merged)
+        for fb in fbs:
+            merged.setdefault(feedback_key(fb), fb)
+        added += len(merged) - before
+        skip += SITE_TAKE
+        if len(fbs) < SITE_TAKE:    # дошли до конца этого среза
+            break
+        time.sleep(REQUEST_DELAY)
+    return added
+
+
+def _collect_site_api(session: requests.Session, imt_id: int, merged: dict) -> tuple:
+    """
+    ОСНОВНОЙ источник: постраничный site-API (POST). Чтобы обойти лимит глубины
+    (~1000 на один срез), запрашиваем не только «все подряд», но и отдельно по каждой
+    оценке 1..5 — это многократно расширяет покрытие. Всё объединяется в merged.
+
+    Возвращает (count, count_with_text). Если site-API недоступен — (0, 0), и тогда
+    остаётся результат статических эндпоинтов.
+    """
+    count = count_with_text = 0
+    # 1) выбираем рабочий хост (probe-запрос с логом статуса)
+    host_url = None
+    for url in SITE_API_ENDPOINTS:
+        probe = post_json(session, url, {"imtId": imt_id, "skip": 0, "take": 1,
+                                         "order": "dateDesc"})
+        if probe is not None and "feedbacks" in probe:
+            host_url = url
+            count = int(probe.get("feedbackCount") or 0)
+            count_with_text = int(probe.get("feedbackCountWithText") or 0)
+            log.info("  [site] рабочий хост: %s (всего %d, с текстом %d)",
+                     url, count, count_with_text)
+            break
+        log.info("  [site] %s недоступен, пробую следующий…", url)
+    if not host_url:
+        log.warning("  [site] постраничный API недоступен — остаётся только статика (~1000).")
+        return 0, 0
+
+    # 2) «все подряд» + по каждой оценке 1..5 (нарезка против лимита глубины)
+    srez = [("все", {})] + [(f"оценка {v}", {"valuation": v}) for v in (1, 2, 3, 4, 5)]
+    for name, extra in srez:
+        added = _paginate_site(session, host_url, imt_id, extra, merged)
+        log.info("  [site] срез «%s»: добавлено новых %d, уникальных всего %d",
+                 name, added, len(merged))
+    return count, count_with_text
+
+
+def fetch_feedbacks(session: requests.Session, imt_id: int) -> dict:
+    """
+    Собирает максимум отзывов склейки из двух источников и объединяет их (дедуп по id):
+      • постраничный site-API (POST) с нарезкой по оценкам — обходит лимит ~1000;
+      • статические GET-эндпоинты — запас (~1000 свежих), если site-API недоступен.
+
+    Возвращает dict: feedbacks (list), count (int), count_with_text (int).
+    """
+    merged: dict = {}
+    c1, t1 = _collect_site_api(session, imt_id, merged)
+    c2, t2 = _collect_static(session, imt_id, merged)
+    count = max(c1, c2) or len(merged)
+    count_with_text = max(t1, t2)
+    log.info("  Итого собрано уникальных отзывов: %d (по API всего %d, с текстом %d)",
+             len(merged), count, count_with_text)
     return {
         "feedbacks": list(merged.values()),
-        "count": count or len(merged),
+        "count": count,
         "count_with_text": count_with_text,
     }
 
