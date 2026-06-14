@@ -11,9 +11,10 @@ wb_reviews.py — выгрузка отзывов покупателей Wildber
   Цепочка запросов:
     1) card.wb.ru/cards/v2/detail?nm=<артикул>   -> получаем root (imtId), бренд, название.
        imtId — это и есть "склейка": общий идентификатор для группы вариантов товара.
-    2) feedbacks{1,2}.wb.ru/feedbacks/v{1,2}/<imtId> -> получаем ВСЕ отзывы склейки одним ответом.
-       Отзывы приходят сразу целиком (без постраничности), поэтому мы получаем
-       все текстовые отзывы и затем сами фильтруем по дате (последние N дней).
+    2) feedbacks{1,2}.wb.ru/feedbacks/v{1,2}/<imtId> -> отзывы склейки.
+       ВАЖНО: один ответ может содержать лишь ЧАСТЬ отзывов (WB шардирует их по
+       хостам/версиям), поэтому опрашиваем ВСЕ эндпоинты и ОБЪЕДИНЯЕМ результат
+       (дедуп по id). Затем сами фильтруем по тексту и дате.
 
   Решение проблемы "склейки" (см. п.3 ТЗ):
     Ответ feedbacks содержит для КАЖДОГО отзыва поле nmId (и productDetails.nmId).
@@ -65,7 +66,7 @@ except Exception:  # pragma: no cover
 
 DEFAULT_DAYS = 365          # выгружаем отзывы за последние N дней
 MIN_TEXT_LEN = 2            # минимальная длина текста отзыва (символов)
-REQUEST_TIMEOUT = 30        # таймаут одного HTTP-запроса, сек
+REQUEST_TIMEOUT = 60        # таймаут одного HTTP-запроса, сек (ответы бывают крупные)
 REQUEST_DELAY = 0.7         # задержка между артикулами/запросами, сек (бережём сайт)
 MAX_RETRIES = 4             # число повторных попыток при сетевых/временных ошибках
 BACKOFF_BASE = 2            # экспоненциальная пауза: 2, 4, 8, 16 сек
@@ -303,24 +304,44 @@ def resolve_card(session: requests.Session, nm_id: int) -> dict:
 
 def fetch_feedbacks(session: requests.Session, imt_id: int) -> dict:
     """
-    Перебирает хосты/версии feedbacks и возвращает первый непустой ответ.
-    Возвращает dict с ключами:
-      feedbacks (list), count (int), count_with_text (int).
+    Собирает ВСЕ отзывы склейки.
+
+    Важно: WB раздаёт отзывы по разным хостам/версиям (feedbacks1/feedbacks2, v1/v2),
+    и один ответ может содержать лишь ЧАСТЬ отзывов (хотя в метаданных feedbackCount
+    указано полное число). Поэтому мы опрашиваем ВСЕ эндпоинты и ОБЪЕДИНЯЕМ отзывы,
+    убирая дубли по id. Раньше бралась первая непустая выдача — из-за этого терялась
+    основная масса отзывов (например, сохранялось 218 вместо 13681).
+
+    Возвращает dict: feedbacks (list), count (int), count_with_text (int).
     """
+    merged: dict = {}            # ключ -> отзыв, чтобы не было дублей
+    count = 0
+    count_with_text = 0
+
     for tmpl in FEEDBACK_ENDPOINTS:
         url = tmpl.format(imt=imt_id)
         data = get_json(session, url)
         if not data:
             continue
-        feedbacks = data.get("feedbacks") or []
-        if feedbacks:
-            return {
-                "feedbacks": feedbacks,
-                "count": data.get("feedbackCount") or len(feedbacks),
-                "count_with_text": data.get("feedbackCountWithText") or 0,
-            }
+        fbs = data.get("feedbacks") or []
+        # метаданные (полные счётчики) берём максимальные из всех ответов
+        count = max(count, int(data.get("feedbackCount") or 0))
+        count_with_text = max(count_with_text, int(data.get("feedbackCountWithText") or 0))
+        for fb in fbs:
+            # дедуп: по id отзыва, а если id нет — по (nmId, текст, дата)
+            key = fb.get("id") or (
+                fb.get("nmId"), fb.get("text"), fb.get("createdDate"))
+            if key not in merged:
+                merged[key] = fb
+        log.info("  • %s -> в этом ответе %d, уникальных всего %d",
+                 url, len(fbs), len(merged))
         time.sleep(REQUEST_DELAY)
-    return {"feedbacks": [], "count": 0, "count_with_text": 0}
+
+    return {
+        "feedbacks": list(merged.values()),
+        "count": count or len(merged),
+        "count_with_text": count_with_text,
+    }
 
 
 # --------------------------------------------------------------------------- #
